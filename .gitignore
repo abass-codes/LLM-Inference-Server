@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Personal notes, not part of the published repo
+SPEC.md
+learning.md
+
+.DS_Store
+
+# Server logs from benchmark runs
+benchmarks/results/**/server_*.log
+
+# Per-request detail from benchmark runs (results.csv, summary.md and the plots are kept)
+benchmarks/results/**/runs/
+
+# Demo UI build output and dependencies
+ui/node_modules/
+ui/dist/

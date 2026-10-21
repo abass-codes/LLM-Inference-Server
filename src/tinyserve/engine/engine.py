@@ -1,0 +1,283 @@
+"""Text generation: run the model, sample a token, append it, repeat.
+
+Generation has two phases:
+
+1. Prefill: run the whole prompt through the model in one call. This fills the
+   KV cache with every prompt token's K and V and yields the first new token.
+2. Decode: feed back the newest token alone, one model call per token, until
+   an EOS token, a stop string, or max_tokens.
+
+`generate()` does this for one prompt. `run_static_batch()` does it for a batch
+of requests at once. `Engine` serves the HTTP server from a background thread,
+with either static batching or continuous batching (`scheduler.py`).
+"""
+
+import logging
+import queue
+import threading
+import time
+from typing import Literal
+
+import torch
+from transformers import PreTrainedTokenizerBase
+
+from tinyserve.engine.kv_cache import KVCache
+from tinyserve.engine.request import Request, append_token
+from tinyserve.engine.sampler import SamplingParams, make_generator, sample
+from tinyserve.engine.scheduler import Scheduler
+from tinyserve.metrics import prometheus as metrics
+from tinyserve.model.llama import LlamaConfig, LlamaWeights, forward
+
+log = logging.getLogger(__name__)
+
+
+@torch.inference_mode()
+def generate(
+    weights: LlamaWeights,
+    config: LlamaConfig,
+    prompt_ids: list[int],
+    params: SamplingParams,
+    use_kv_cache: bool = True,
+) -> list[int]:
+    """Generate up to params.max_tokens tokens for one prompt. Returns only the new tokens
+    (including the EOS token, if one ended the sequence).
+
+    use_kv_cache=False is the simple version kept for comparison: every step
+    reruns the model over the entire sequence so far. Its output is identical;
+    it just redoes all the work for earlier tokens at every step.
+    """
+    device = weights.embed.device
+    generator = make_generator(params.seed, device)
+    output: list[int] = []
+
+    cache = None
+    if use_kv_cache:
+        max_len = len(prompt_ids) + params.max_tokens
+        cache = KVCache.allocate(config, 1, max_len, device, weights.embed.dtype)  # one block
+
+    input_ids = torch.tensor([prompt_ids], device=device)  # prefill: the whole prompt
+    start_pos = 0
+    while len(output) < params.max_tokens:
+        logits = forward(weights, config, input_ids, start_pos, cache)
+        next_token = int(sample(logits[:, -1], [params], [generator]).item())
+        output.append(next_token)
+        if next_token in config.eos_token_ids:
+            break
+
+        if cache is not None:
+            # Decode: only the new token goes through the model; the cache
+            # already holds K and V for everything before it.
+            start_pos += input_ids.shape[1]
+            input_ids = torch.tensor([[next_token]], device=device)
+        else:
+            input_ids = torch.tensor([prompt_ids + output], device=device)
+
+    return output
+
+
+@torch.inference_mode()
+def run_static_batch(
+    weights: LlamaWeights,
+    config: LlamaConfig,
+    requests: list[Request],
+    tokenizer: PreTrainedTokenizerBase | None = None,
+) -> None:
+    """Static batching: prefill every request, then decode them all together until
+    the last one finishes. Results are written into each Request.
+
+    Batching pays off because decode is memory-bound: each step has to read all
+    the weights anyway, and one read can serve every row of the batch. The catch
+    is that a request which finishes early keeps its row, and keeps costing a
+    row of compute every step, until the slowest request in the batch is done.
+    New requests can't join until then either. Continuous batching fixes both.
+    """
+    device = weights.embed.device
+    # Every row may run for as many steps as the longest request, so each row
+    # needs room for the longest prompt plus the largest max_tokens.
+    max_len = max(len(r.prompt_ids) for r in requests) + max(r.params.max_tokens for r in requests)
+    cache = KVCache.allocate(config, len(requests), max_len, device, weights.embed.dtype)
+    params = [r.params for r in requests]
+    generators = [make_generator(r.params.seed, device) for r in requests]
+
+    # Prefill one prompt at a time, each into its own cache row. Batching
+    # prompts of different lengths would need padding, and prefill is already
+    # compute-bound, so batching it would gain little.
+    last_logits = torch.cat(
+        [
+            forward(weights, config, torch.tensor([r.prompt_ids], device=device), 0, cache, [[i]])[
+                :, -1
+            ]
+            for i, r in enumerate(requests)
+        ]
+    )
+    lengths = [len(r.prompt_ids) for r in requests]
+
+    while True:
+        next_tokens = sample(last_logits, params, generators).tolist()
+        for request, token in zip(requests, next_tokens):
+            if not request.finished:
+                append_token(request, token, config, tokenizer)
+        if all(r.finished for r in requests):
+            return
+
+        # Decode one token for every row, finished rows included: static
+        # batching has no way to hand their slot to anyone else.
+        input_ids = torch.tensor([[t] for t in next_tokens], device=device)
+        last_logits = forward(weights, config, input_ids, lengths, cache)[:, -1]
+        lengths = [n + 1 for n in lengths]
+
+
+class Engine:
+    """Owns the model and runs requests on a background thread.
+
+    The model calls block for milliseconds to seconds, so they can't run on the
+    web server's event loop: it would stop accepting and answering requests.
+    The server puts requests on a queue; this thread takes them off, runs them,
+    and reports back through each request's on_finish.
+
+    batching="continuous" (the default) runs the scheduler step by step, letting
+    requests join and leave the batch at every step. batching="static" is the
+    simpler baseline: collect up to max_batch_size requests, run them to completion.
+
+    kv_cache="paged" (the default) splits kv_cache_gb into 16-token blocks;
+    "contiguous" reserves max_model_len tokens per sequence (continuous batching only).
+    """
+
+    def __init__(
+        self,
+        weights: LlamaWeights,
+        config: LlamaConfig,
+        tokenizer: PreTrainedTokenizerBase | None = None,
+        max_batch_size: int = 8,
+        batch_wait_s: float = 0.05,
+        batching: Literal["continuous", "static"] = "continuous",
+        max_model_len: int = 4096,
+        kv_cache: Literal["paged", "contiguous"] = "paged",
+        kv_cache_gb: float = 4.0,
+    ) -> None:
+        self.weights = weights
+        self.config = config
+        self.tokenizer = tokenizer
+        self.max_batch_size = max_batch_size
+        self.batch_wait_s = batch_wait_s
+        self.batching = batching
+        self.max_model_len = max_model_len
+        self.kv_cache = kv_cache
+        self.kv_cache_gb = kv_cache_gb
+        self.queue: queue.Queue[Request] = queue.Queue()
+        self.scheduler: Scheduler | None = None  # the running scheduler, for inspection
+        self.thread: threading.Thread | None = None
+
+    def submit(self, request: Request) -> None:
+        self.queue.put(request)
+
+    def start(self) -> None:
+        """Start the engine thread. The scheduler (and its KV cache) is built here, on
+        the caller's thread, so a bad configuration fails at startup instead of
+        killing the engine thread while the server keeps accepting requests."""
+        if self.batching == "continuous":
+            self.scheduler = self._new_scheduler()
+            target = self._continuous_loop
+        else:
+            target = self._static_loop
+        self.thread = threading.Thread(target=target, name="engine", daemon=True)
+        self.thread.start()
+
+    @property
+    def alive(self) -> bool:
+        """False if the engine thread has died: the server can't generate anything."""
+        return self.thread is not None and self.thread.is_alive()
+
+    def _finish(self, requests: list[Request]) -> None:
+        for request in requests:
+            metrics.record_finish(request.arrival_time, str(request.finish_reason))
+            if request.on_finish is not None:
+                request.on_finish(request)
+
+    def _record_state(self, scheduler: Scheduler, preemptions_before: int) -> None:
+        metrics.PREEMPTIONS.inc(scheduler.num_preemptions - preemptions_before)
+        allocator = scheduler.allocator
+        metrics.record_scheduler_state(
+            waiting=len(scheduler.waiting) + self.queue.qsize(),
+            running=len(scheduler.running),
+            kv_blocks_used_ratio=1 - allocator.num_free / allocator.num_blocks,
+        )
+
+    def _new_scheduler(self) -> Scheduler:
+        return Scheduler.with_memory_budget(
+            self.weights,
+            self.config,
+            self.kv_cache,
+            self.kv_cache_gb,
+            self.max_batch_size,
+            self.max_model_len,
+            self.tokenizer,
+        )
+
+    def _add(self, scheduler: Scheduler, request: Request) -> None:
+        try:
+            scheduler.add(request)
+        except ValueError:  # e.g. longer than max_model_len: fail this request, not the engine
+            log.warning("rejected request %s", request.id, exc_info=True)
+            request.finish_reason = "error"
+            self._finish([request])
+
+    def _continuous_loop(self) -> None:
+        assert self.scheduler is not None  # built by start()
+        scheduler = self.scheduler
+        while True:
+            # Block only when idle; otherwise pick up new arrivals without waiting
+            # and go straight back to stepping the running sequences.
+            if not scheduler.has_work():
+                self._record_state(scheduler, scheduler.num_preemptions)  # idle: all zeros
+                self._add(scheduler, self.queue.get())
+            while not self.queue.empty():
+                self._add(scheduler, self.queue.get_nowait())
+            preemptions_before = scheduler.num_preemptions
+            try:
+                finished = scheduler.step()
+                self._record_state(scheduler, preemptions_before)
+            except Exception:
+                log.exception("scheduler step failed; failing all in-flight requests")
+                finished = [s.request for s in scheduler.running] + list(scheduler.waiting)
+                for request in finished:
+                    request.finish_reason = request.finish_reason or "error"
+                scheduler = self.scheduler = self._new_scheduler()
+            self._finish(finished)
+
+    def _next_batch(self) -> list[Request]:
+        """Block until a request arrives, then wait up to batch_wait_s for more to
+        fill the batch. Waiting longer makes bigger batches (more throughput) but
+        delays the first request (worse latency)."""
+        batch = [self.queue.get()]
+        deadline = time.monotonic() + self.batch_wait_s
+        while len(batch) < self.max_batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(self.queue.get(timeout=remaining))
+            except queue.Empty:
+                break
+        return [r for r in batch if not r.finished]  # skip requests aborted while queued
+
+    def _static_loop(self) -> None:
+        while True:
+            batch = self._next_batch()
+            if not batch:
+                continue
+            log.info("running a batch of %d requests", len(batch))
+            metrics.record_scheduler_state(
+                waiting=self.queue.qsize(), running=len(batch), kv_blocks_used_ratio=0.0
+            )
+            try:
+                run_static_batch(self.weights, self.config, batch, self.tokenizer)
+            except Exception:
+                log.exception("batch of %d requests failed", len(batch))
+                for request in batch:
+                    if not request.finished:
+                        request.finish_reason = "error"
+            self._finish(batch)
+            metrics.record_scheduler_state(
+                waiting=self.queue.qsize(), running=0, kv_blocks_used_ratio=0.0
+            )
