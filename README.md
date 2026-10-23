@@ -1,6 +1,6 @@
-# tinyserve
+# LLM-Inference-Server
 
-An LLM inference server built from scratch in PyTorch, serving Llama 3.2.
+LLM inference server was built from scratch in PyTorch, serving Llama 3.2.
 
 ## Results
 
